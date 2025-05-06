@@ -1,0 +1,110 @@
+name: Collect Release Notes
+
+on:
+  pull_request:
+    types: [opened, edited, labeled, unlabeled, synchronize]
+    branches:
+      - main
+
+jobs:
+  collect-release-notes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Extract Release Notes
+        id: extract-notes
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body;
+            if (!prBody) {
+              core.setFailed('PR body is empty. Please include release notes.');
+              return;
+            }
+
+            // Look for release note sections in the PR description
+            const featureMatch = prBody.match(/## Feature\s*\[Feature\]\s*([\s\S]*?)(?=##|$)/);
+            const bugFixMatch = prBody.match(/## Bug Fix\s*\[Bug Fix\]\s*([\s\S]*?)(?=##|$)/);
+            const documentationMatch = prBody.match(/## Documentation\s*\[Documentation\]\s*([\s\S]*?)(?=##|$)/);
+            const choreMatch = prBody.match(/## Chore\s*\[Chore\]\s*([\s\S]*?)(?=##|$)/);
+
+            let releaseNoteType = null;
+            let releaseNote = null;
+
+            if (featureMatch) {
+              releaseNoteType = 'Feature';
+              releaseNote = featureMatch[1].trim();
+            } else if (bugFixMatch) {
+              releaseNoteType = 'Bug Fix';
+              releaseNote = bugFixMatch[1].trim();
+            } else if (documentationMatch) {
+              releaseNoteType = 'Documentation';
+              releaseNote = documentationMatch[1].trim();
+            } else if (choreMatch) {
+              releaseNoteType = 'Chore';
+              releaseNote = choreMatch[1].trim();
+            }
+
+            if (!releaseNoteType || !releaseNote) {
+              core.setFailed('No valid release notes found. Please include a Feature or Bug Fix section in your PR description.');
+              return;
+            }
+
+            // Set outputs for use in subsequent steps
+            core.setOutput('type', releaseNoteType);
+            core.setOutput('note', releaseNote);
+
+            // Comment on PR
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ Release note detected:\n\n**Type**: ${releaseNoteType}\n\n**Note**: ${releaseNote}`
+            });
+
+            // Add label based on release note type
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: [`release-note:${releaseNoteType.toLowerCase().replace(' ', '-')}`]
+            });
+
+      - name: Store Release Notes
+        if: steps.extract-notes.outputs.type && steps.extract-notes.outputs.note
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+
+            const prNumber = context.payload.pull_request.number;
+            const prTitle = context.payload.pull_request.title;
+            const noteType = '${{ steps.extract-notes.outputs.type }}';
+            const noteContent = '${{ steps.extract-notes.outputs.note }}';
+
+            // Create JSON for this PR
+            const releaseNoteData = {
+              pr: prNumber,
+              title: prTitle,
+              type: noteType,
+              content: noteContent,
+              author: context.payload.pull_request.user.login,
+              date: new Date().toISOString()
+            };
+
+            // Use PR number in filename to avoid conflicts
+            const filename = `.github/release-notes/pr-${prNumber}.json`;
+
+            // Create pull request to store the release note data
+            await github.rest.pulls.createOrUpdateReviewComment({
+              pull_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `📝 Release note metadata created for PR #${prNumber}`
+            });

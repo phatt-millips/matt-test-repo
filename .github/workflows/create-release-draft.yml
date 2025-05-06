@@ -1,0 +1,233 @@
+name: Create Release Draft
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update-release-draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Get latest tag
+        id: latest-tag
+        run: |
+          # Get latest tag or use v0.0.0 as default
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag is $LATEST_TAG"
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Calculate next version
+        id: next-version
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const latestTag = '${{ steps.latest-tag.outputs.latest_tag }}';
+            console.log(`Latest tag: ${latestTag}`);
+            
+            // Remove 'v' prefix
+            const versionString = latestTag.replace(/^v/, '');
+            const [major, minor, patch] = versionString.split('.').map(Number);
+            
+            // Default to minor bump, but check for merged PRs to determine
+            let newVersion = `v${major}.${minor + 1}.0`;
+            
+            console.log(`Next version will be ${newVersion}`);
+            core.setOutput('next_version', newVersion);
+      
+      - name: Collect merged PRs since last tag
+        id: collect-prs
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const latestTag = '${{ steps.latest-tag.outputs.latest_tag }}';
+            console.log(`Finding PRs merged since ${latestTag}`);
+            
+            // Get the date of the last tag
+            let sinceDate;
+            try {
+              const tagRef = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${latestTag}`
+              });
+              
+              const tagSha = tagRef.data.object.sha;
+              const tagData = await github.rest.git.getTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_sha: tagSha
+              });
+              
+              sinceDate = tagData.data.tagger.date;
+            } catch (error) {
+              console.log('No previous tag found or error fetching tag, using 30 days ago as default');
+              const thirtyDaysAgo = new Date();
+              thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+              sinceDate = thirtyDaysAgo.toISOString();
+            }
+            
+            // Find merged PRs to main since the last tag
+            const query = `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged base:main merged:>${sinceDate}`;
+            console.log(`Searching for PRs with query: ${query}`);
+            
+            const searchResult = await github.rest.search.issuesAndPullRequests({
+              q: query,
+              per_page: 100
+            });
+            
+            console.log(`Found ${searchResult.data.items.length} PRs`);
+            
+            // Sort PRs and extract release notes
+            const features = [];
+            const bugFixes = [];
+            const documentation = [];
+            const chores = [];
+            
+            for (const pr of searchResult.data.items) {
+              // Look for release note type labels
+              const labels = pr.labels.map(label => label.name);
+              
+              let noteType = null;
+              if (labels.includes('release-note:feature')) {
+                noteType = 'Feature';
+              } else if (labels.includes('release-note:bug-fix')) {
+                noteType = 'Bug Fix';
+              } else if (labels.includes('release-note:documentation')) {
+                noteType = 'Documentation';
+              } else if (labels.includes('release-note:chore')) {
+                noteType = 'Chore';
+              }
+              
+              if (!noteType) {
+                console.log(`PR #${pr.number} has no release note type label, skipping`);
+                continue;
+              }
+              
+              // Extract release note from PR body
+              const prBody = pr.body || '';
+              let releaseNote = '';
+              
+              if (noteType === 'Feature') {
+                const match = prBody.match(/## Feature\s*\[Feature\]\s*([\s\S]*?)(?=##|$)/);
+                if (match) releaseNote = match[1].trim();
+              } else if (noteType === 'Bug Fix') {
+                const match = prBody.match(/## Bug Fix\s*\[Bug Fix\]\s*([\s\S]*?)(?=##|$)/);
+                if (match) releaseNote = match[1].trim();
+              } else if (noteType === 'Documentation') {
+                const match = prBody.match(/## Documentation\s*\[Documentation\]\s*([\s\S]*?)(?=##|$)/);
+                if (match) releaseNote = match[1].trim();
+              } else if (noteType === 'Chore') {
+                const match = prBody.match(/## Chore\s*\[Chore\]\s*([\s\S]*?)(?=##|$)/);
+                if (match) releaseNote = match[1].trim();
+              }
+              
+              if (!releaseNote) {
+                releaseNote = pr.title; // Fallback to PR title if no specific note found
+              }
+              
+              const noteEntry = `- ${releaseNote} (PR #${pr.number} by @${pr.user.login})`;
+              
+              // Add to appropriate category
+              if (noteType === 'Feature') {
+                features.push(noteEntry);
+              } else if (noteType === 'Bug Fix') {
+                bugFixes.push(noteEntry);
+              } else if (noteType === 'Documentation') {
+                documentation.push(noteEntry);
+              } else if (noteType === 'Chore') {
+                chores.push(noteEntry);
+              }
+            }
+            
+            // Generate release notes markdown
+            let releaseNotes = `## What's Changed\n\n`;
+            
+            if (features.length > 0) {
+              releaseNotes += `### 🚀 Features\n\n${features.join('\n')}\n\n`;
+            }
+            
+            if (bugFixes.length > 0) {
+              releaseNotes += `### 🐛 Bug Fixes\n\n${bugFixes.join('\n')}\n\n`;
+            }
+            
+            if (documentation.length > 0) {
+              releaseNotes += `### 📚 Documentation\n\n${documentation.join('\n')}\n\n`;
+            }
+            
+            if (chores.length > 0) {
+              releaseNotes += `### 🧹 Maintenance\n\n${chores.join('\n')}\n\n`;
+            }
+            
+            // Add a footer
+            releaseNotes += `\n\n**Full Changelog**: https://github.com/${context.repo.owner}/${context.repo.repo}/compare/${latestTag}...main`;
+            
+            core.setOutput('release_notes', releaseNotes);
+      
+      - name: Update or create release draft
+        id: release-drafter
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const nextVersion = '${{ steps.next-version.outputs.next_version }}';
+            const releaseNotes = `${{ steps.collect-prs.outputs.release_notes }}`;
+            
+            // Check if a draft release already exists
+            let releaseId;
+            try {
+              const releases = await github.rest.repos.listReleases({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              
+              const draftRelease = releases.data.find(release => release.draft && release.tag_name === nextVersion);
+              if (draftRelease) {
+                releaseId = draftRelease.id;
+              }
+            } catch (error) {
+              console.log('Error checking existing releases', error);
+            }
+            
+            // Update or create draft release
+            try {
+              if (releaseId) {
+                // Update existing draft
+                console.log(`Updating existing draft release ${releaseId}`);
+                await github.rest.repos.updateRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: releaseId,
+                  name: nextVersion,
+                  body: releaseNotes,
+                  draft: true,
+                  prerelease: false
+                });
+              } else {
+                // Create new draft
+                console.log(`Creating new draft release for ${nextVersion}`);
+                await github.rest.repos.createRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag_name: nextVersion,
+                  name: nextVersion,
+                  body: releaseNotes,
+                  draft: true,
+                  prerelease: false,
+                  target_commitish: 'main'
+                });
+              }
+              console.log('Draft release created or updated successfully');
+            } catch (error) {
+              core.setFailed(`Error creating/updating release: ${error.message}`);
+            }
